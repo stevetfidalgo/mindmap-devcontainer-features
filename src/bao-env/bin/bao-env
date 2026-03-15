@@ -1,0 +1,1565 @@
+#!/usr/bin/env bash
+#
+# Manage OpenBao environment variables from a YAML manifest.
+#
+# Unified CLI for viewing, checking, comparing, syncing, setting,
+# copying, and deleting environment variables in OpenBao KV stores.
+# Variables and their types (config vs secret) are declared in a
+# checked-in manifest file (bao-env.yml).
+#
+# Usage:
+#   bao-env [--manifest PATH] <subcommand> [args...]
+#
+# Subcommands:
+#   show <env>                     Show all variables for an environment
+#   check                          Drift detection across all environments
+#   compare <VAR>[,VAR...]         Cross-environment table for variables
+#   sync                           Interactive gap-filler for missing values
+#   set <env> KEY=VALUE[,...]      Set values in an environment
+#   copy <from> <to> KEY[,KEY...]   Copy specific keys between environments
+#   copy <from> <to> --all         Copy all keys between environments
+#                                  [--force] [--dry-run]
+#   delete <env> KEY[,KEY...]      Delete specific keys from an environment
+#   delete <env> --all             Delete all data for an environment
+#   clear <env> KEY[,KEY...]       Clear values (set to "") for specific keys
+#   clear <env> --all              Clear all values for an environment
+#
+# Options:
+#   --manifest PATH    Path to manifest file (default: bao-env.yml in repo root)
+#   --help, -h         Show this help message
+#
+# Examples:
+#   bao-env show dev
+#   bao-env check
+#   bao-env compare NEO4J_URI,LOG_LEVEL
+#   bao-env set dev LOG_LEVEL=debug
+#   bao-env copy dev demo LOG_LEVEL,NEO4J_URI
+#   bao-env copy dev demo --all
+#   bao-env delete test OPENAI_API_KEY
+#   bao-env delete test --all
+#   bao-env clear dev OPENAI_API_KEY,NEO4J_PASSWORD
+#   bao-env clear dev --all
+
+set -euo pipefail
+
+# --- Defaults ---
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo ".")"
+MANIFEST="${REPO_ROOT}/bao-env.yml"
+
+# --- Manifest data (populated by load_manifest) ---
+
+PROJECT=""
+ENVIRONMENTS=()
+SPARSE_ENVS=()
+CONFIG_VARS=()
+SECRET_VARS=()
+ALL_VARS=()
+declare -A VAR_TYPE
+declare -A IS_SPARSE
+
+# --- Functions ---
+
+usage() {
+  sed -n '2,/^$/{ s/^# \{0,1\}//; p; }' "$0"
+  exit "${1:-1}"
+}
+
+require_bao() {
+  if ! bao status > /dev/null 2>&1; then
+    echo "Error: cannot connect to OpenBao (is BAO_ADDR set and server unsealed?)" >&2
+    exit 1
+  fi
+}
+
+load_manifest() {
+  if [[ ! -f "$MANIFEST" ]]; then
+    echo "Error: manifest not found: $MANIFEST" >&2
+    exit 1
+  fi
+
+  PROJECT=$(yq -r '.project' "$MANIFEST")
+  if [[ -z "$PROJECT" || "$PROJECT" == "null" ]]; then
+    echo "Error: manifest missing 'project' field" >&2
+    exit 1
+  fi
+
+  # Load environments
+  while IFS= read -r env; do
+    [[ -z "$env" || "$env" == "null" ]] && continue
+    ENVIRONMENTS+=("$env")
+  done < <(yq -r '.environments[]' "$MANIFEST")
+
+  if [[ ${#ENVIRONMENTS[@]} -eq 0 ]]; then
+    echo "Error: manifest has no environments" >&2
+    exit 1
+  fi
+
+  # Load sparse environments (optional)
+  while IFS= read -r env; do
+    [[ -z "$env" || "$env" == "null" ]] && continue
+    SPARSE_ENVS+=("$env")
+    IS_SPARSE["$env"]=1
+  done < <(yq -r '.sparse[]' "$MANIFEST" 2>/dev/null)
+
+  # Load config variables
+  while IFS= read -r var; do
+    [[ -z "$var" || "$var" == "null" ]] && continue
+    CONFIG_VARS+=("$var")
+    ALL_VARS+=("$var")
+    VAR_TYPE["$var"]="config"
+  done < <(yq -r '.config[]' "$MANIFEST")
+
+  # Load secret variables
+  while IFS= read -r var; do
+    [[ -z "$var" || "$var" == "null" ]] && continue
+    SECRET_VARS+=("$var")
+    ALL_VARS+=("$var")
+    VAR_TYPE["$var"]="secret"
+  done < <(yq -r '.secret[]' "$MANIFEST")
+
+  if [[ ${#ALL_VARS[@]} -eq 0 ]]; then
+    echo "Error: manifest has no variables" >&2
+    exit 1
+  fi
+}
+
+# Validate a list of key names against the manifest.
+# Checks for: unknown keys (not in manifest), duplicate keys.
+# Exits with error if any issues found.
+# Usage: validate_keys [--force] KEY [KEY...]
+# With --force, unknown keys produce warnings instead of errors.
+validate_keys() {
+  local force=false
+  if [[ "${1:-}" == "--force" ]]; then
+    force=true
+    shift
+  fi
+
+  local -a keys=("$@")
+  local -a unknown_keys=()
+  local -a duplicate_keys=()
+  local -A seen_keys=()
+
+  for key in "${keys[@]}"; do
+    # Check duplicates
+    if [[ -n "${seen_keys[$key]+x}" ]]; then
+      duplicate_keys+=("$key")
+    else
+      seen_keys["$key"]=1
+    fi
+
+    # Check manifest
+    if [[ -z "${VAR_TYPE[$key]+x}" ]]; then
+      unknown_keys+=("$key")
+    fi
+  done
+
+  local has_error=false
+
+  if [[ ${#duplicate_keys[@]} -gt 0 ]]; then
+    echo "Error: duplicate keys:" >&2
+    for key in "${duplicate_keys[@]}"; do
+      echo "  $key" >&2
+    done
+    has_error=true
+  fi
+
+  if [[ ${#unknown_keys[@]} -gt 0 ]]; then
+    if [[ "$force" == true ]]; then
+      for key in "${unknown_keys[@]}"; do
+        echo "Warning: $key not in manifest" >&2
+      done
+    else
+      echo "Error: keys not in manifest (use --force to override):" >&2
+      for key in "${unknown_keys[@]}"; do
+        echo "  $key" >&2
+      done
+      has_error=true
+    fi
+  fi
+
+  if $has_error; then
+    exit 1
+  fi
+}
+
+# Split comma-separated items in an array.
+# Usage: split_csv input_array_name output_array_name
+# Each element containing commas is expanded into multiple elements.
+split_csv() {
+  local -n _in=$1 _out=$2
+  _out=()
+  for item in "${_in[@]}"; do
+    IFS=',' read -ra parts <<< "$item"
+    _out+=("${parts[@]}")
+  done
+}
+
+var_mount() {
+  local var="$1"
+  if [[ -z "${VAR_TYPE[$var]+x}" ]]; then
+    echo "unknown"
+    return 1
+  fi
+  echo "${VAR_TYPE[$var]}"
+}
+
+mask_secret() {
+  local value="$1"
+  local len=${#value}
+
+  # Very short values: fully masked
+  if [[ $len -le 4 ]]; then
+    printf '%*s\n' "$len" '' | tr ' ' '*'
+    return
+  fi
+
+  # Show up to 25% of chars, minimum 3, but never more than len-2
+  # so at least 2 chars are always masked
+  local chars_to_show=$(( len / 4 ))
+  if [[ $chars_to_show -lt 3 ]]; then
+    chars_to_show=3
+  fi
+  local max_show=$(( len - 2 ))
+  if [[ $chars_to_show -gt $max_show ]]; then
+    chars_to_show=$max_show
+  fi
+
+  local masked_len=$(( len - chars_to_show ))
+  local visible="${value:0:$chars_to_show}"
+  local masked
+  masked=$(printf '%*s' "$masked_len" '' | tr ' ' '*')
+  printf '%s\n' "${visible}${masked}"
+}
+
+# --- Bao data fetching ---
+
+# Temp directory for caching Bao responses within a single invocation.
+# Created eagerly at top level so the EXIT trap is registered in the
+# main shell, not inside a $() subshell (which would delete the dir
+# when the subshell exits).
+_BAO_CACHE_DIR=$(mktemp -d)
+trap 'rm -rf "$_BAO_CACHE_DIR"' EXIT
+
+# Fetch KV data from Bao for a given mount/env path.
+# Outputs the JSON object of key-value pairs (the .data.data portion).
+# Returns {} if the path doesn't exist.
+# Results are cached per mount/env within the invocation.
+fetch_env_data() {
+  local mount="$1"
+  local env="$2"
+  local cache_file="${_BAO_CACHE_DIR}/${mount}_${env}.json"
+
+  if [[ -f "$cache_file" ]]; then
+    cat "$cache_file"
+    return
+  fi
+
+  local raw
+  if raw=$(bao kv get -format=json "${mount}/${PROJECT}/${env}" 2>/dev/null); then
+    echo "$raw" | jq -r '.data.data' > "$cache_file"
+  else
+    echo '{}' > "$cache_file"
+  fi
+  cat "$cache_file"
+}
+
+# --- Subcommands ---
+
+cmd_show() {
+  if [[ $# -lt 1 ]]; then
+    echo "Usage: bao-env show <env>" >&2
+    exit 1
+  fi
+
+  local env="$1"
+
+  # Validate environment
+  local valid=false
+  for e in "${ENVIRONMENTS[@]}"; do
+    if [[ "$e" == "$env" ]]; then
+      valid=true
+      break
+    fi
+  done
+  if ! $valid; then
+    echo "Error: unknown environment '$env'" >&2
+    echo "Valid environments: ${ENVIRONMENTS[*]}" >&2
+    exit 1
+  fi
+
+  require_bao
+
+  # Fetch data from both mounts for the target env
+  local config_env_data secret_env_data
+  config_env_data=$(fetch_env_data config "$env")
+  secret_env_data=$(fetch_env_data secret "$env")
+
+  # Fetch shared data if env is not shared
+  local config_shared_data='{}' secret_shared_data='{}'
+  if [[ "$env" != "shared" ]]; then
+    config_shared_data=$(fetch_env_data config shared)
+    secret_shared_data=$(fetch_env_data secret shared)
+  fi
+
+  # Collect results per mount for display
+  local -a missing_vars=()
+  local -a unexpected_vars=()
+  local -a mismatch_vars=()
+
+  # Track all Bao keys we've seen so we can detect unexpected ones
+  local -A seen_bao_keys=()
+
+  # ---- Config section ----
+  local shared_label=""
+  if [[ "$env" != "shared" ]]; then
+    shared_label=" + shared"
+  fi
+  echo "=== ${env} (config/${PROJECT}/${env}${shared_label}) ==="
+  echo ""
+
+  # Compute column widths for config vars
+  local max_var_len=8  # minimum "Variable"
+  local max_val_len=5  # minimum "Value"
+  for var in "${CONFIG_VARS[@]}"; do
+    local vlen=${#var}
+    if [[ $vlen -gt $max_var_len ]]; then
+      max_var_len=$vlen
+    fi
+    # Look up value and build source list
+    local val=""
+    local source=""
+    local in_env="" in_shared=""
+    in_env=$(echo "$config_env_data" | jq -r --arg k "$var" '.[$k] // empty')
+    if [[ "$env" != "shared" ]]; then
+      in_shared=$(echo "$config_shared_data" | jq -r --arg k "$var" '.[$k] // empty')
+    fi
+    # Display value: env wins, then shared
+    val="${in_env:-$in_shared}"
+    # Source: list all locations
+    if [[ -n "$in_shared" && -n "$in_env" ]]; then
+      source="shared, $env"
+    elif [[ -n "$in_shared" ]]; then
+      source="shared"
+    elif [[ -n "$in_env" ]]; then
+      source="$env"
+    fi
+    if [[ -n "$val" ]]; then
+      local dlen=${#val}
+      if [[ $dlen -gt $max_val_len ]]; then
+        max_val_len=$dlen
+      fi
+    fi
+  done
+
+  # Cap value column at 40 chars for readability
+  if [[ $max_val_len -gt 40 ]]; then
+    max_val_len=40
+  fi
+
+  printf "  %-${max_var_len}s  %-${max_val_len}s  %s\n" "Variable" "Value" "Source"
+  local config_has_rows=false
+  for var in "${CONFIG_VARS[@]}"; do
+    local val=""
+    local source=""
+    local in_env="" in_shared=""
+    in_env=$(echo "$config_env_data" | jq -r --arg k "$var" '.[$k] // empty')
+    if [[ -n "$in_env" ]]; then
+      seen_bao_keys["config:${env}:${var}"]=1
+    fi
+    if [[ "$env" != "shared" ]]; then
+      in_shared=$(echo "$config_shared_data" | jq -r --arg k "$var" '.[$k] // empty')
+      if [[ -n "$in_shared" ]]; then
+        seen_bao_keys["config:shared:${var}"]=1
+      fi
+    fi
+    val="${in_env:-$in_shared}"
+    if [[ -n "$in_shared" && -n "$in_env" ]]; then
+      source="shared, $env"
+    elif [[ -n "$in_shared" ]]; then
+      source="shared"
+    elif [[ -n "$in_env" ]]; then
+      source="$env"
+    fi
+
+    if [[ -n "$val" ]]; then
+      # Truncate display value if too long
+      local display_val="$val"
+      if [[ ${#display_val} -gt $max_val_len ]]; then
+        display_val="${display_val:0:$(( max_val_len - 3 ))}..."
+      fi
+      printf "  %-${max_var_len}s  %-${max_val_len}s  %s\n" "$var" "$display_val" "$source"
+      config_has_rows=true
+
+      # Check for mount mismatch: config var also in secret mount
+      local in_secret_env="" in_secret_shared=""
+      in_secret_env=$(echo "$secret_env_data" | jq -r --arg k "$var" '.[$k] // empty')
+      if [[ "$env" != "shared" ]]; then
+        in_secret_shared=$(echo "$secret_shared_data" | jq -r --arg k "$var" '.[$k] // empty')
+      fi
+      if [[ -n "$in_secret_env" || -n "$in_secret_shared" ]]; then
+        mismatch_vars+=("$var")
+      fi
+    else
+      missing_vars+=("$var")
+    fi
+  done
+
+  if ! $config_has_rows; then
+    printf "  %s\n" "(no config variables set)"
+  fi
+
+  echo ""
+
+  # ---- Secret section ----
+  echo "=== ${env} (secret/${PROJECT}/${env}${shared_label}) ==="
+  echo ""
+
+  # Compute column widths for secret vars
+  max_var_len=8
+  max_val_len=5
+  for var in "${SECRET_VARS[@]}"; do
+    local vlen=${#var}
+    if [[ $vlen -gt $max_var_len ]]; then
+      max_var_len=$vlen
+    fi
+    local val=""
+    local in_env="" in_shared=""
+    in_env=$(echo "$secret_env_data" | jq -r --arg k "$var" '.[$k] // empty')
+    if [[ "$env" != "shared" ]]; then
+      in_shared=$(echo "$secret_shared_data" | jq -r --arg k "$var" '.[$k] // empty')
+    fi
+    val="${in_env:-$in_shared}"
+    if [[ -n "$val" ]]; then
+      local masked
+      masked=$(mask_secret "$val")
+      local mlen=${#masked}
+      if [[ $mlen -gt $max_val_len ]]; then
+        max_val_len=$mlen
+      fi
+    fi
+  done
+
+  if [[ $max_val_len -gt 40 ]]; then
+    max_val_len=40
+  fi
+
+  printf "  %-${max_var_len}s  %-${max_val_len}s  %s\n" "Variable" "Value" "Source"
+  local secret_has_rows=false
+  for var in "${SECRET_VARS[@]}"; do
+    local val=""
+    local source=""
+    local in_env="" in_shared=""
+    in_env=$(echo "$secret_env_data" | jq -r --arg k "$var" '.[$k] // empty')
+    if [[ -n "$in_env" ]]; then
+      seen_bao_keys["secret:${env}:${var}"]=1
+    fi
+    if [[ "$env" != "shared" ]]; then
+      in_shared=$(echo "$secret_shared_data" | jq -r --arg k "$var" '.[$k] // empty')
+      if [[ -n "$in_shared" ]]; then
+        seen_bao_keys["secret:shared:${var}"]=1
+      fi
+    fi
+    val="${in_env:-$in_shared}"
+    if [[ -n "$in_shared" && -n "$in_env" ]]; then
+      source="shared, $env"
+    elif [[ -n "$in_shared" ]]; then
+      source="shared"
+    elif [[ -n "$in_env" ]]; then
+      source="$env"
+    fi
+
+    if [[ -n "$val" ]]; then
+      local masked
+      masked=$(mask_secret "$val")
+      local display_val="$masked"
+      if [[ ${#display_val} -gt $max_val_len ]]; then
+        display_val="${display_val:0:$(( max_val_len - 3 ))}..."
+      fi
+      printf "  %-${max_var_len}s  %-${max_val_len}s  %s\n" "$var" "$display_val" "$source"
+      secret_has_rows=true
+
+      # Check for mount mismatch: secret var also in config mount
+      local in_config_env="" in_config_shared=""
+      in_config_env=$(echo "$config_env_data" | jq -r --arg k "$var" '.[$k] // empty')
+      if [[ "$env" != "shared" ]]; then
+        in_config_shared=$(echo "$config_shared_data" | jq -r --arg k "$var" '.[$k] // empty')
+      fi
+      if [[ -n "$in_config_env" || -n "$in_config_shared" ]]; then
+        mismatch_vars+=("$var")
+      fi
+    else
+      missing_vars+=("$var")
+    fi
+  done
+
+  if ! $secret_has_rows; then
+    printf "  %s\n" "(no secret variables set)"
+  fi
+
+  # ---- Scan for unexpected variables ----
+  # Check all keys in env and shared Bao data against the manifest
+  local -a bao_datasets=()
+  bao_datasets+=("config|${env}|${config_env_data}")
+  bao_datasets+=("secret|${env}|${secret_env_data}")
+  if [[ "$env" != "shared" ]]; then
+    bao_datasets+=("config|shared|${config_shared_data}")
+    bao_datasets+=("secret|shared|${secret_shared_data}")
+  fi
+
+  for dataset in "${bao_datasets[@]}"; do
+    local ds_mount ds_env ds_data
+    ds_mount="${dataset%%|*}"
+    local rest="${dataset#*|}"
+    ds_env="${rest%%|*}"
+    ds_data="${rest#*|}"
+
+    while IFS= read -r key; do
+      [[ -z "$key" ]] && continue
+      if [[ -z "${VAR_TYPE[$key]+x}" ]]; then
+        unexpected_vars+=("${key}|${ds_mount}/${PROJECT}/${ds_env}")
+      fi
+    done < <(echo "$ds_data" | jq -r 'keys[]' 2>/dev/null)
+  done
+
+  # ---- Print missing, unexpected, mismatch sections ----
+  if [[ ${#missing_vars[@]} -gt 0 && -z "${IS_SPARSE[$env]+x}" ]]; then
+    echo ""
+    echo "Missing (not in ${env} or shared):"
+    for var in "${missing_vars[@]}"; do
+      printf "  %-40s  %s\n" "$var" "(not set)"
+    done
+  fi
+
+  if [[ ${#unexpected_vars[@]} -gt 0 ]]; then
+    echo ""
+    echo "Unexpected (in Bao but not in manifest):"
+    for entry in "${unexpected_vars[@]}"; do
+      local uvar upath
+      uvar="${entry%%|*}"
+      upath="${entry#*|}"
+      printf "  %-40s  %s\n" "$uvar" "$upath"
+    done
+  fi
+
+  if [[ ${#mismatch_vars[@]} -gt 0 ]]; then
+    # Deduplicate
+    local -A mismatch_seen=()
+    echo ""
+    echo "Mount mismatches:"
+    for mvar in "${mismatch_vars[@]}"; do
+      [[ -n "${mismatch_seen[$mvar]+x}" ]] && continue
+      mismatch_seen["$mvar"]=1
+      local declared_mount
+      declared_mount=$(var_mount "$mvar")
+      echo "  ${mvar}"
+      echo "      manifest: ${declared_mount}"
+      # Check each mount in env and shared
+      for mnt in config secret; do
+        local in_e="" in_s=""
+        if [[ "$mnt" == "config" ]]; then
+          in_e=$(echo "$config_env_data" | jq -r --arg k "$mvar" '.[$k] // empty')
+          [[ "$env" != "shared" ]] && in_s=$(echo "$config_shared_data" | jq -r --arg k "$mvar" '.[$k] // empty')
+        else
+          in_e=$(echo "$secret_env_data" | jq -r --arg k "$mvar" '.[$k] // empty')
+          [[ "$env" != "shared" ]] && in_s=$(echo "$secret_shared_data" | jq -r --arg k "$mvar" '.[$k] // empty')
+        fi
+        [[ -n "$in_s" ]] && echo "      shared: ${mnt}"
+        [[ -n "$in_e" ]] && echo "      ${env}: ${mnt}"
+      done
+    done
+  fi
+}
+
+cmd_check() {
+  require_bao
+
+  local -a missing_entries=()
+  local -a unexpected_entries=()
+  local -a mismatch_entries=()
+
+  # Fetch data for all environments
+  declare -A env_config_data env_secret_data
+  for env in "${ENVIRONMENTS[@]}"; do
+    env_config_data["$env"]=$(fetch_env_data config "$env")
+    env_secret_data["$env"]=$(fetch_env_data secret "$env")
+  done
+
+  # Check each non-sparse environment
+  for env in "${ENVIRONMENTS[@]}"; do
+    [[ -n "${IS_SPARSE[$env]+x}" ]] && continue
+
+    for var in "${ALL_VARS[@]}"; do
+      local mount
+      mount=$(var_mount "$var")
+      local val=""
+
+      # Check env-specific data
+      if [[ "$mount" == "config" ]]; then
+        val=$(echo "${env_config_data[$env]}" | jq -r --arg k "$var" '.[$k] // empty')
+      else
+        val=$(echo "${env_secret_data[$env]}" | jq -r --arg k "$var" '.[$k] // empty')
+      fi
+
+      # Fall back to shared
+      if [[ -z "$val" && "$env" != "shared" ]]; then
+        if [[ "$mount" == "config" ]]; then
+          val=$(echo "${env_config_data[shared]}" | jq -r --arg k "$var" '.[$k] // empty')
+        else
+          val=$(echo "${env_secret_data[shared]}" | jq -r --arg k "$var" '.[$k] // empty')
+        fi
+      fi
+
+      if [[ -z "$val" ]]; then
+        missing_entries+=("${var}|${env}")
+      fi
+    done
+  done
+
+  # Check for unexpected vars and mount mismatches across all envs
+  for env in "${ENVIRONMENTS[@]}"; do
+    for mount in config secret; do
+      local data
+      if [[ "$mount" == "config" ]]; then
+        data="${env_config_data[$env]}"
+      else
+        data="${env_secret_data[$env]}"
+      fi
+
+      while IFS= read -r key; do
+        [[ -z "$key" ]] && continue
+        if [[ -z "${VAR_TYPE[$key]+x}" ]]; then
+          unexpected_entries+=("${key}|${mount}/${PROJECT}/${env}")
+        else
+          # Check mount mismatch
+          local expected_mount
+          expected_mount=$(var_mount "$key")
+          if [[ "$mount" != "$expected_mount" ]]; then
+            mismatch_entries+=("${key}|${expected_mount}|${mount}|${env}")
+          fi
+        fi
+      done < <(echo "$data" | jq -r 'keys[]' 2>/dev/null)
+    done
+  done
+
+  # Print results
+  local found_issues=false
+
+  if [[ ${#missing_entries[@]} -gt 0 ]]; then
+    found_issues=true
+    echo "Missing variables:"
+    # Group by variable name
+    local -A missing_by_var=()
+    for entry in "${missing_entries[@]}"; do
+      local var="${entry%%|*}"
+      local env="${entry#*|}"
+      if [[ -n "${missing_by_var[$var]+x}" ]]; then
+        missing_by_var["$var"]="${missing_by_var[$var]}, ${env}"
+      else
+        missing_by_var["$var"]="$env"
+      fi
+    done
+    for var in "${ALL_VARS[@]}"; do
+      if [[ -n "${missing_by_var[$var]+x}" ]]; then
+        local mount
+        mount=$(var_mount "$var")
+        printf "  %-40s  (%s)  missing from: %s\n" "$var" "$mount" "${missing_by_var[$var]}"
+      fi
+    done
+    echo ""
+  fi
+
+  if [[ ${#unexpected_entries[@]} -gt 0 ]]; then
+    found_issues=true
+    echo "Unexpected variables (in Bao, not in manifest):"
+    for entry in "${unexpected_entries[@]}"; do
+      local var="${entry%%|*}"
+      local path="${entry#*|}"
+      printf "  %-40s  %s\n" "$var" "$path"
+    done
+    echo ""
+  fi
+
+  if [[ ${#mismatch_entries[@]} -gt 0 ]]; then
+    found_issues=true
+    echo "Mount mismatches:"
+    # Group by variable: collect all env:mount locations
+    local -A mismatch_locations=()
+    local -a mismatch_var_order=()
+    for entry in "${mismatch_entries[@]}"; do
+      local var="${entry%%|*}"
+      local rest="${entry#*|}"
+      local declared="${rest%%|*}"
+      rest="${rest#*|}"
+      local found="${rest%%|*}"
+      local env="${rest#*|}"
+      if [[ -z "${mismatch_locations[$var]+x}" ]]; then
+        mismatch_var_order+=("$var")
+        mismatch_locations["$var"]=""
+      fi
+      mismatch_locations["$var"]+="${env}:${found}|"
+    done
+    for var in "${mismatch_var_order[@]}"; do
+      local declared_mount
+      declared_mount=$(var_mount "$var")
+      echo "  ${var}"
+      echo "      manifest: ${declared_mount}"
+      # List all env:mount locations for this var (both correct and wrong mount)
+      for env in "${ENVIRONMENTS[@]}"; do
+        for mnt in config secret; do
+          local data
+          if [[ "$mnt" == "config" ]]; then
+            data="${env_config_data[$env]}"
+          else
+            data="${env_secret_data[$env]}"
+          fi
+          local val
+          val=$(echo "$data" | jq -r --arg k "$var" '.[$k] // empty')
+          if [[ -n "$val" ]]; then
+            echo "      ${env}: ${mnt}"
+          fi
+        done
+      done
+    done
+    echo ""
+  fi
+
+  if $found_issues; then
+    local missing_count=${#missing_entries[@]}
+    local unexpected_count=${#unexpected_entries[@]}
+    local mismatch_count=${#mismatch_entries[@]}
+    echo "Summary: ${missing_count} missing, ${unexpected_count} unexpected, ${mismatch_count} misplaced"
+    exit 1
+  else
+    echo "All variables accounted for across all environments."
+  fi
+}
+
+cmd_compare() {
+  if [[ $# -lt 1 ]]; then
+    echo "Usage: bao-env compare <VAR> [VAR...]" >&2
+    exit 1
+  fi
+
+  require_bao
+
+  local -a _raw_vars=("$@")
+  local -a vars=()
+  split_csv _raw_vars vars
+
+  # Warn about vars not in manifest
+  for var in "${vars[@]}"; do
+    if [[ -z "${VAR_TYPE[$var]+x}" ]]; then
+      echo "Warning: $var is not in the manifest" >&2
+    fi
+  done
+
+  # Fetch data for all environments
+  declare -A env_config_data env_secret_data
+  for env in "${ENVIRONMENTS[@]}"; do
+    env_config_data["$env"]=$(fetch_env_data config "$env")
+    env_secret_data["$env"]=$(fetch_env_data secret "$env")
+  done
+
+  for var in "${vars[@]}"; do
+    local mount="unknown"
+    if [[ -n "${VAR_TYPE[$var]+x}" ]]; then
+      mount=$(var_mount "$var")
+    fi
+
+    echo "=== ${var} (${mount}) ==="
+    echo ""
+
+    for env in "${ENVIRONMENTS[@]}"; do
+      local val=""
+
+      # Try both mounts if unknown, otherwise use the declared mount
+      if [[ "$mount" == "config" || "$mount" == "unknown" ]]; then
+        val=$(echo "${env_config_data[$env]}" | jq -r --arg k "$var" '.[$k] // empty')
+      fi
+      if [[ -z "$val" && ("$mount" == "secret" || "$mount" == "unknown") ]]; then
+        val=$(echo "${env_secret_data[$env]}" | jq -r --arg k "$var" '.[$k] // empty')
+      fi
+
+      if [[ -n "$val" ]]; then
+        local display_val="$val"
+        # Mask if secret type
+        if [[ "${VAR_TYPE[$var]:-}" == "secret" ]]; then
+          display_val=$(mask_secret "$val")
+        fi
+        printf "  %-10s  %s\n" "$env" "$display_val"
+      else
+        printf "  %-10s  %s\n" "$env" "(not set)"
+      fi
+    done
+
+    echo ""
+  done
+}
+
+cmd_set() {
+  local dry_run=false
+  local force=false
+  local env=""
+  local -a pairs=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=true; shift ;;
+      --force)   force=true; shift ;;
+      -*)        echo "Unknown option: $1" >&2; exit 1 ;;
+      *)
+        if [[ -z "$env" ]]; then
+          env="$1"
+        else
+          pairs+=("$1")
+        fi
+        shift ;;
+    esac
+  done
+
+  # Split comma-separated pairs
+  if [[ ${#pairs[@]} -gt 0 ]]; then
+    local -a _raw_pairs=("${pairs[@]}")
+    pairs=()
+    split_csv _raw_pairs pairs
+  fi
+
+  if [[ -z "$env" || ${#pairs[@]} -eq 0 ]]; then
+    echo "Usage: bao-env set <env>[,<env>...] KEY=VALUE[,KEY=VALUE...] [--dry-run] [--force]" >&2
+    exit 1
+  fi
+
+  # Split comma-separated environments
+  local -a envs=()
+  IFS=',' read -ra envs <<< "$env"
+
+  # Validate all environments
+  for target_env in "${envs[@]}"; do
+    local valid=false
+    for e in "${ENVIRONMENTS[@]}"; do
+      [[ "$e" == "$target_env" ]] && valid=true && break
+    done
+    if ! $valid; then
+      echo "Error: unknown environment '$target_env'" >&2
+      echo "Valid environments: ${ENVIRONMENTS[*]}" >&2
+      exit 1
+    fi
+  done
+
+  if [[ "$dry_run" == false ]]; then
+    require_bao
+  fi
+
+  # Group pairs by mount
+  local -a config_args=()
+  local -a secret_args=()
+
+  for pair in "${pairs[@]}"; do
+    local key="${pair%%=*}"
+    if [[ "$key" == "$pair" ]]; then
+      echo "Error: invalid format '$pair' (expected KEY=VALUE)" >&2
+      exit 1
+    fi
+
+    if [[ -z "${VAR_TYPE[$key]+x}" ]]; then
+      if [[ "$force" == true ]]; then
+        echo "Warning: $key not in manifest, defaulting to secret mount" >&2
+        secret_args+=("$pair")
+      else
+        echo "Error: $key is not in the manifest (use --force to override)" >&2
+        exit 1
+      fi
+    else
+      local mount
+      mount=$(var_mount "$key")
+      if [[ "$mount" == "config" ]]; then
+        config_args+=("$pair")
+      else
+        secret_args+=("$pair")
+      fi
+    fi
+  done
+
+  for target_env in "${envs[@]}"; do
+    # Write config vars
+    if [[ ${#config_args[@]} -gt 0 ]]; then
+      local path="config/${PROJECT}/${target_env}"
+      if [[ "$dry_run" == true ]]; then
+        echo "[dry-run] Would set at ${path}:"
+        for arg in "${config_args[@]}"; do
+          echo "  ${arg}"
+        done
+      else
+        if ! bao kv patch "$path" "${config_args[@]}" 2>/dev/null; then
+          bao kv put "$path" "${config_args[@]}"
+        fi
+        echo "Set ${#config_args[@]} config value(s) at ${path}"
+      fi
+    fi
+
+    # Write secret vars
+    if [[ ${#secret_args[@]} -gt 0 ]]; then
+      local path="secret/${PROJECT}/${target_env}"
+      if [[ "$dry_run" == true ]]; then
+        echo "[dry-run] Would set at ${path}:"
+        for arg in "${secret_args[@]}"; do
+          echo "  ${arg%%=*}=***"
+        done
+      else
+        if ! bao kv patch "$path" "${secret_args[@]}" 2>/dev/null; then
+          bao kv put "$path" "${secret_args[@]}"
+        fi
+        echo "Set ${#secret_args[@]} secret value(s) at ${path}"
+      fi
+    fi
+  done
+}
+
+cmd_copy() {
+  local dry_run=false
+  local force=false
+  local copy_all=false
+  local from_env=""
+  local to_env=""
+  local -a requested_keys=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=true; shift ;;
+      --force)   force=true; shift ;;
+      --all)     copy_all=true; shift ;;
+      -*)        echo "Unknown option: $1" >&2; exit 1 ;;
+      *)
+        if [[ -z "$from_env" ]]; then
+          from_env="$1"
+        elif [[ -z "$to_env" ]]; then
+          to_env="$1"
+        else
+          requested_keys+=("$1")
+        fi
+        shift ;;
+    esac
+  done
+
+  if [[ -z "$from_env" || -z "$to_env" ]]; then
+    echo "Usage: bao-env copy <from-env> <to-env> KEY[,KEY...] [--force] [--dry-run]" >&2
+    echo "       bao-env copy <from-env> <to-env> --all [--dry-run]" >&2
+    exit 1
+  fi
+
+  # Split comma-separated keys
+  if [[ ${#requested_keys[@]} -gt 0 ]]; then
+    local -a _raw_keys=("${requested_keys[@]}")
+    requested_keys=()
+    split_csv _raw_keys requested_keys
+  fi
+
+  if [[ ${#requested_keys[@]} -eq 0 && "$copy_all" == false ]]; then
+    echo "Error: specify keys to copy, or use --all" >&2
+    exit 1
+  fi
+
+  if [[ ${#requested_keys[@]} -gt 0 && "$copy_all" == true ]]; then
+    echo "Error: cannot specify both keys and --all" >&2
+    exit 1
+  fi
+
+  if [[ "$from_env" == "$to_env" ]]; then
+    echo "Error: source and destination are the same" >&2
+    exit 1
+  fi
+
+  # Validate both environments
+  for check_env in "$from_env" "$to_env"; do
+    local valid=false
+    for e in "${ENVIRONMENTS[@]}"; do
+      [[ "$e" == "$check_env" ]] && valid=true && break
+    done
+    if ! $valid; then
+      echo "Error: unknown environment '$check_env'" >&2
+      echo "Valid environments: ${ENVIRONMENTS[*]}" >&2
+      exit 1
+    fi
+  done
+
+  # Validate keys against manifest
+  if [[ ${#requested_keys[@]} -gt 0 ]]; then
+    if [[ "$force" == true ]]; then
+      validate_keys --force "${requested_keys[@]}"
+    else
+      validate_keys "${requested_keys[@]}"
+    fi
+  fi
+
+  require_bao
+
+  local copied=0
+  for mount in config secret; do
+    local src_path="${mount}/${PROJECT}/${from_env}"
+    local dst_path="${mount}/${PROJECT}/${to_env}"
+
+    local data
+    data=$(fetch_env_data "$mount" "$from_env")
+
+    # Build kv args: filter to requested keys or take all
+    local -a kv_args=()
+    if [[ "$copy_all" == true ]]; then
+      local keys
+      keys=$(echo "$data" | jq -r 'keys[]' 2>/dev/null)
+      if [[ -z "$keys" ]]; then
+        echo "=== ${src_path} -> ${dst_path}: (empty, skipping) ==="
+        continue
+      fi
+      while IFS= read -r key; do
+        local value
+        value=$(echo "$data" | jq -r --arg k "$key" '.[$k]')
+        kv_args+=("${key}=${value}")
+      done <<< "$keys"
+    else
+      for key in "${requested_keys[@]}"; do
+        local value
+        value=$(echo "$data" | jq -r --arg k "$key" '.[$k] // empty')
+        if [[ -n "$value" ]]; then
+          kv_args+=("${key}=${value}")
+        fi
+      done
+      if [[ ${#kv_args[@]} -eq 0 ]]; then
+        continue
+      fi
+    fi
+
+    if [[ "$dry_run" == true ]]; then
+      echo "=== ${src_path} -> ${dst_path}: [dry-run] would copy ${#kv_args[@]} keys ==="
+      for arg in "${kv_args[@]}"; do
+        echo "  ${arg%%=*}"
+      done
+    else
+      if ! bao kv patch "$dst_path" "${kv_args[@]}" 2>/dev/null; then
+        bao kv put "$dst_path" "${kv_args[@]}"
+      fi
+      echo "=== ${src_path} -> ${dst_path}: copied ${#kv_args[@]} keys ==="
+      copied=$((copied + 1))
+    fi
+  done
+
+  # Warn about keys not found in source
+  if [[ "$copy_all" == false ]]; then
+    local config_data secret_data
+    config_data=$(fetch_env_data config "$from_env")
+    secret_data=$(fetch_env_data secret "$from_env")
+    for key in "${requested_keys[@]}"; do
+      local in_config in_secret
+      in_config=$(echo "$config_data" | jq -r --arg k "$key" '.[$k] // empty')
+      in_secret=$(echo "$secret_data" | jq -r --arg k "$key" '.[$k] // empty')
+      if [[ -z "$in_config" && -z "$in_secret" ]]; then
+        echo "Warning: ${key} not found in ${from_env}" >&2
+      fi
+    done
+  fi
+
+  if [[ "$dry_run" == true ]]; then
+    echo ""
+    echo "Dry run complete. No changes made."
+  else
+    echo ""
+    echo "Done. Copied ${copied} path(s)."
+  fi
+}
+
+cmd_delete() {
+  local dry_run=false
+  local force=false
+  local delete_all=false
+  local env=""
+  local -a requested_keys=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=true; shift ;;
+      --force)   force=true; shift ;;
+      --all)     delete_all=true; shift ;;
+      -*)        echo "Unknown option: $1" >&2; exit 1 ;;
+      *)
+        if [[ -z "$env" ]]; then
+          env="$1"
+        else
+          requested_keys+=("$1")
+        fi
+        shift ;;
+    esac
+  done
+
+  if [[ -z "$env" ]]; then
+    echo "Usage: bao-env delete <env> KEY[,KEY...] [--force] [--dry-run]" >&2
+    echo "       bao-env delete <env> --all [--force] [--dry-run]" >&2
+    exit 1
+  fi
+
+  # Split comma-separated keys
+  if [[ ${#requested_keys[@]} -gt 0 ]]; then
+    local -a _raw_keys=("${requested_keys[@]}")
+    requested_keys=()
+    split_csv _raw_keys requested_keys
+  fi
+
+  if [[ ${#requested_keys[@]} -eq 0 && "$delete_all" == false ]]; then
+    echo "Error: specify keys to delete, or use --all" >&2
+    exit 1
+  fi
+
+  if [[ ${#requested_keys[@]} -gt 0 && "$delete_all" == true ]]; then
+    echo "Error: cannot specify both keys and --all" >&2
+    exit 1
+  fi
+
+  # Validate environment
+  local valid=false
+  for e in "${ENVIRONMENTS[@]}"; do
+    [[ "$e" == "$env" ]] && valid=true && break
+  done
+  if ! $valid; then
+    echo "Error: unknown environment '$env'" >&2
+    echo "Valid environments: ${ENVIRONMENTS[*]}" >&2
+    exit 1
+  fi
+
+  # Validate keys against manifest
+  if [[ ${#requested_keys[@]} -gt 0 ]]; then
+    if [[ "$force" == true ]]; then
+      validate_keys --force "${requested_keys[@]}"
+    else
+      validate_keys "${requested_keys[@]}"
+    fi
+  fi
+
+  if [[ "$delete_all" == true ]]; then
+    echo "Will delete all data at:"
+    echo "  config/${PROJECT}/${env}"
+    echo "  secret/${PROJECT}/${env}"
+  else
+    echo "Will delete from ${env}:"
+    for key in "${requested_keys[@]}"; do
+      echo "  ${key}"
+    done
+  fi
+  echo ""
+
+  if [[ "$dry_run" == true ]]; then
+    echo "Dry run complete. No changes made."
+    return
+  fi
+
+  if [[ "$force" == false ]]; then
+    read -rp "Are you sure? (y/N) " confirm
+    if [[ "$confirm" != [yY] ]]; then
+      echo "Aborted."
+      return
+    fi
+  fi
+
+  require_bao
+
+  if [[ "$delete_all" == true ]]; then
+    local deleted=0
+    for mount in config secret; do
+      local path="${mount}/${PROJECT}/${env}"
+      if bao kv metadata delete "$path" 2>/dev/null; then
+        echo "Deleted: ${path}"
+        deleted=$((deleted + 1))
+      else
+        echo "Not found: ${path}"
+      fi
+    done
+    echo ""
+    echo "Deleted ${deleted} path(s)."
+  else
+    # Delete individual keys by reading current data, removing keys, and writing back
+    local removed=0
+    for mount in config secret; do
+      local path="${mount}/${PROJECT}/${env}"
+      local data
+      data=$(fetch_env_data "$mount" "$env")
+
+      # Find which requested keys exist in this mount
+      local -a keys_in_mount=()
+      for key in "${requested_keys[@]}"; do
+        local val
+        val=$(echo "$data" | jq -r --arg k "$key" '.[$k] // empty')
+        if [[ -n "$val" ]]; then
+          keys_in_mount+=("$key")
+        fi
+      done
+
+      [[ ${#keys_in_mount[@]} -eq 0 ]] && continue
+
+      # Build jq filter to remove the keys
+      local jq_filter="."
+      for key in "${keys_in_mount[@]}"; do
+        jq_filter="${jq_filter} | del(.[\"${key}\"])"
+      done
+
+      local remaining
+      remaining=$(echo "$data" | jq -r "$jq_filter")
+      local remaining_count
+      remaining_count=$(echo "$remaining" | jq 'length')
+
+      if [[ "$remaining_count" -eq 0 ]]; then
+        # No keys left — delete the entire path
+        bao kv metadata delete "$path" 2>/dev/null
+      else
+        # Write back remaining keys
+        local -a kv_args=()
+        while IFS= read -r k; do
+          local v
+          v=$(echo "$remaining" | jq -r --arg k "$k" '.[$k]')
+          kv_args+=("${k}=${v}")
+        done < <(echo "$remaining" | jq -r 'keys[]')
+        bao kv put "$path" "${kv_args[@]}"
+      fi
+
+      for key in "${keys_in_mount[@]}"; do
+        echo "Deleted ${key} from ${path}"
+        removed=$((removed + 1))
+      done
+    done
+
+    # Warn about keys not found
+    for key in "${requested_keys[@]}"; do
+      local config_data secret_data in_config in_secret
+      config_data=$(fetch_env_data config "$env")
+      secret_data=$(fetch_env_data secret "$env")
+      in_config=$(echo "$config_data" | jq -r --arg k "$key" '.[$k] // empty')
+      in_secret=$(echo "$secret_data" | jq -r --arg k "$key" '.[$k] // empty')
+      if [[ -z "$in_config" && -z "$in_secret" ]]; then
+        echo "Warning: ${key} not found in ${env}" >&2
+      fi
+    done
+
+    echo ""
+    echo "Deleted ${removed} key(s)."
+  fi
+}
+
+cmd_clear() {
+  local dry_run=false
+  local force=false
+  local clear_all=false
+  local env=""
+  local -a requested_keys=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=true; shift ;;
+      --force)   force=true; shift ;;
+      --all)     clear_all=true; shift ;;
+      -*)        echo "Unknown option: $1" >&2; exit 1 ;;
+      *)
+        if [[ -z "$env" ]]; then
+          env="$1"
+        else
+          requested_keys+=("$1")
+        fi
+        shift ;;
+    esac
+  done
+
+  if [[ -z "$env" ]]; then
+    echo "Usage: bao-env clear <env> KEY[,KEY...] [--force] [--dry-run]" >&2
+    echo "       bao-env clear <env> --all [--force] [--dry-run]" >&2
+    exit 1
+  fi
+
+  # Split comma-separated keys
+  if [[ ${#requested_keys[@]} -gt 0 ]]; then
+    local -a _raw_keys=("${requested_keys[@]}")
+    requested_keys=()
+    split_csv _raw_keys requested_keys
+  fi
+
+  if [[ ${#requested_keys[@]} -eq 0 && "$clear_all" == false ]]; then
+    echo "Error: specify keys to clear, or use --all" >&2
+    exit 1
+  fi
+
+  if [[ ${#requested_keys[@]} -gt 0 && "$clear_all" == true ]]; then
+    echo "Error: cannot specify both keys and --all" >&2
+    exit 1
+  fi
+
+  # Validate environment
+  local valid=false
+  for e in "${ENVIRONMENTS[@]}"; do
+    [[ "$e" == "$env" ]] && valid=true && break
+  done
+  if ! $valid; then
+    echo "Error: unknown environment '$env'" >&2
+    echo "Valid environments: ${ENVIRONMENTS[*]}" >&2
+    exit 1
+  fi
+
+  # Validate keys against manifest
+  if [[ ${#requested_keys[@]} -gt 0 ]]; then
+    if [[ "$force" == true ]]; then
+      validate_keys --force "${requested_keys[@]}"
+    else
+      validate_keys "${requested_keys[@]}"
+    fi
+  fi
+
+  require_bao
+
+  # Determine which keys to clear
+  local -a keys_to_clear=()
+  if [[ "$clear_all" == true ]]; then
+    # Collect all keys present in this env across both mounts
+    for mount in config secret; do
+      local data
+      data=$(fetch_env_data "$mount" "$env")
+      while IFS= read -r key; do
+        [[ -z "$key" ]] && continue
+        keys_to_clear+=("$key")
+      done < <(echo "$data" | jq -r 'keys[]' 2>/dev/null)
+    done
+    if [[ ${#keys_to_clear[@]} -eq 0 ]]; then
+      echo "No keys found in ${env}. Nothing to clear."
+      return
+    fi
+  else
+    keys_to_clear=("${requested_keys[@]}")
+  fi
+
+  echo "Will clear values in ${env}:"
+  for key in "${keys_to_clear[@]}"; do
+    echo "  ${key}"
+  done
+  echo ""
+
+  if [[ "$dry_run" == true ]]; then
+    echo "Dry run complete. No changes made."
+    return
+  fi
+
+  if [[ "$force" == false ]]; then
+    read -rp "Are you sure? (y/N) " confirm
+    if [[ "$confirm" != [yY] ]]; then
+      echo "Aborted."
+      return
+    fi
+  fi
+
+  local cleared=0
+  for mount in config secret; do
+    local path="${mount}/${PROJECT}/${env}"
+    local data
+    data=$(fetch_env_data "$mount" "$env")
+
+    # Find which keys to clear exist in this mount
+    local -a kv_args=()
+    for key in "${keys_to_clear[@]}"; do
+      local val
+      val=$(echo "$data" | jq -r --arg k "$key" '.[$k] // empty')
+      if [[ -n "$val" ]]; then
+        kv_args+=("${key}=")
+      fi
+    done
+
+    [[ ${#kv_args[@]} -eq 0 ]] && continue
+
+    if ! bao kv patch "$path" "${kv_args[@]}" 2>/dev/null; then
+      # Path doesn't exist yet — rebuild full data with cleared keys
+      local -a put_args=()
+      while IFS= read -r k; do
+        local v
+        v=$(echo "$data" | jq -r --arg k "$k" '.[$k]')
+        put_args+=("${k}=${v}")
+      done < <(echo "$data" | jq -r 'keys[]')
+      # Override the cleared keys
+      for arg in "${kv_args[@]}"; do
+        local ck="${arg%%=*}"
+        # Remove existing entry and add cleared one
+        local -a new_put_args=()
+        for pa in "${put_args[@]}"; do
+          [[ "${pa%%=*}" == "$ck" ]] && continue
+          new_put_args+=("$pa")
+        done
+        new_put_args+=("${ck}=")
+        put_args=("${new_put_args[@]}")
+      done
+      bao kv put "$path" "${put_args[@]}"
+    fi
+
+    for arg in "${kv_args[@]}"; do
+      echo "Cleared ${arg%%=*} in ${path}"
+      cleared=$((cleared + 1))
+    done
+  done
+
+  # Warn about keys not found
+  for key in "${keys_to_clear[@]}"; do
+    local config_data secret_data in_config in_secret
+    config_data=$(fetch_env_data config "$env")
+    secret_data=$(fetch_env_data secret "$env")
+    in_config=$(echo "$config_data" | jq -r --arg k "$key" '.[$k] // empty')
+    in_secret=$(echo "$secret_data" | jq -r --arg k "$key" '.[$k] // empty')
+    if [[ -z "$in_config" && -z "$in_secret" ]]; then
+      echo "Warning: ${key} not found in ${env}" >&2
+    fi
+  done
+
+  echo ""
+  echo "Cleared ${cleared} key(s)."
+}
+
+cmd_sync() {
+  require_bao
+
+  # Fetch data for all environments
+  declare -A env_config_data env_secret_data
+  for env in "${ENVIRONMENTS[@]}"; do
+    env_config_data["$env"]=$(fetch_env_data config "$env")
+    env_secret_data["$env"]=$(fetch_env_data secret "$env")
+  done
+
+  # Find missing variables per non-sparse env
+  local -A missing_by_var=()
+  local -a missing_var_order=()
+
+  for env in "${ENVIRONMENTS[@]}"; do
+    [[ -n "${IS_SPARSE[$env]+x}" ]] && continue
+
+    for var in "${ALL_VARS[@]}"; do
+      local mount
+      mount=$(var_mount "$var")
+      local val=""
+
+      if [[ "$mount" == "config" ]]; then
+        val=$(echo "${env_config_data[$env]}" | jq -r --arg k "$var" '.[$k] // empty')
+      else
+        val=$(echo "${env_secret_data[$env]}" | jq -r --arg k "$var" '.[$k] // empty')
+      fi
+
+      # Fall back to shared
+      if [[ -z "$val" && "$env" != "shared" ]]; then
+        if [[ "$mount" == "config" ]]; then
+          val=$(echo "${env_config_data[shared]}" | jq -r --arg k "$var" '.[$k] // empty')
+        else
+          val=$(echo "${env_secret_data[shared]}" | jq -r --arg k "$var" '.[$k] // empty')
+        fi
+      fi
+
+      if [[ -z "$val" ]]; then
+        if [[ -z "${missing_by_var[$var]+x}" ]]; then
+          missing_by_var["$var"]="$env"
+          missing_var_order+=("$var")
+        else
+          missing_by_var["$var"]="${missing_by_var[$var]}, ${env}"
+        fi
+      fi
+    done
+  done
+
+  if [[ ${#missing_var_order[@]} -eq 0 ]]; then
+    echo "All variables are set across all non-sparse environments."
+    return
+  fi
+
+  echo "Variables with gaps:"
+  echo ""
+
+  local synced=0
+  for var in "${missing_var_order[@]}"; do
+    local mount
+    mount=$(var_mount "$var")
+    local envs_missing="${missing_by_var[$var]}"
+
+    # Show reference value from any env that has it
+    local ref_val=""
+    local ref_env=""
+    for env in "${ENVIRONMENTS[@]}"; do
+      if [[ "$mount" == "config" ]]; then
+        ref_val=$(echo "${env_config_data[$env]}" | jq -r --arg k "$var" '.[$k] // empty')
+      else
+        ref_val=$(echo "${env_secret_data[$env]}" | jq -r --arg k "$var" '.[$k] // empty')
+      fi
+      if [[ -n "$ref_val" ]]; then
+        ref_env="$env"
+        break
+      fi
+    done
+
+    echo "  ${var} (${mount})"
+    echo "    Missing from: ${envs_missing}"
+    if [[ -n "$ref_val" ]]; then
+      local display_ref="$ref_val"
+      if [[ "$mount" == "secret" ]]; then
+        display_ref=$(mask_secret "$ref_val")
+      fi
+      echo "    Current value in ${ref_env}: ${display_ref}"
+    fi
+
+    read -rp "    Enter value (or press Enter to skip): " new_val
+    if [[ -z "$new_val" ]]; then
+      echo "    Skipped."
+      echo ""
+      continue
+    fi
+
+    # Set in all missing environments
+    IFS=', ' read -ra target_envs <<< "$envs_missing"
+    for target_env in "${target_envs[@]}"; do
+      [[ -z "$target_env" ]] && continue
+      local path="${mount}/${PROJECT}/${target_env}"
+      if ! bao kv patch "$path" "${var}=${new_val}" 2>/dev/null; then
+        bao kv put "$path" "${var}=${new_val}"
+      fi
+      echo "    Set in ${target_env}"
+    done
+    synced=$((synced + 1))
+    echo ""
+  done
+
+  echo "Done. Synced ${synced} variable(s)."
+}
+
+# --- Argument parsing ---
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --manifest)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --manifest requires a value" >&2; usage
+      fi
+      MANIFEST="$2"; shift 2 ;;
+    --help|-h)
+      usage 0 ;;
+    -*)
+      echo "Unknown option: $1" >&2; usage ;;
+    *)
+      break ;;
+  esac
+done
+
+if [[ $# -eq 0 ]]; then
+  usage
+fi
+
+SUBCOMMAND="$1"; shift
+
+load_manifest
+
+case "$SUBCOMMAND" in
+  show)    cmd_show "$@" ;;
+  check)   cmd_check "$@" ;;
+  compare) cmd_compare "$@" ;;
+  sync)    cmd_sync "$@" ;;
+  set)     cmd_set "$@" ;;
+  copy)    cmd_copy "$@" ;;
+  delete)  cmd_delete "$@" ;;
+  clear)   cmd_clear "$@" ;;
+  *)
+    echo "Unknown subcommand: $SUBCOMMAND" >&2
+    usage
+    ;;
+esac
