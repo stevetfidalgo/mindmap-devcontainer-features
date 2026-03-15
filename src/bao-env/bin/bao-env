@@ -23,6 +23,8 @@
 #   delete <env> --all             Delete all data for an environment
 #   clear <env> KEY[,KEY...]       Clear values (set to "") for specific keys
 #   clear <env> --all              Clear all values for an environment
+#   init [--all] [URL|PATH]        Initialize/update local manifest from master
+#   audit                          Compare local manifest against master
 #
 # Options:
 #   --manifest PATH    Path to manifest file (default: bao-env.yml in repo root)
@@ -39,6 +41,9 @@
 #   bao-env delete test --all
 #   bao-env clear dev OPENAI_API_KEY,NEO4J_PASSWORD
 #   bao-env clear dev --all
+#   bao-env init https://raw.githubusercontent.com/.../bao-env.yml
+#   bao-env init --all
+#   bao-env audit
 
 set -euo pipefail
 
@@ -66,8 +71,17 @@ usage() {
 }
 
 require_bao() {
+  if [[ -z "${BAO_ADDR:-}" ]]; then
+    echo "Error: BAO_ADDR is not set" >&2
+    exit 1
+  fi
   if ! bao status > /dev/null 2>&1; then
-    echo "Error: cannot connect to OpenBao (is BAO_ADDR set and server unsealed?)" >&2
+    echo "Error: cannot connect to OpenBao at $BAO_ADDR (is the server running and unsealed?)" >&2
+    exit 1
+  fi
+  # Verify we have a valid token by attempting a simple read
+  if ! bao token lookup > /dev/null 2>&1; then
+    echo "Error: no valid OpenBao token (run 'bao login' or set BAO_TOKEN)" >&2
     exit 1
   fi
 }
@@ -1523,6 +1537,345 @@ cmd_sync() {
   echo "Done. Synced ${synced} variable(s)."
 }
 
+# --- Fetch master manifest ---
+
+# Fetch the master manifest from a URL or local path.
+# Prints the path to a local copy.
+fetch_master_manifest() {
+  local source="$1"
+  local dest
+  dest="$(mktemp)"
+
+  if [[ "$source" =~ ^https?:// ]]; then
+    if ! curl -fsSL "$source" -o "$dest" 2>/dev/null; then
+      echo "Error: failed to fetch master manifest from $source" >&2
+      rm -f "$dest"
+      return 1
+    fi
+  elif [[ -f "$source" ]]; then
+    cp "$source" "$dest"
+  else
+    echo "Error: master manifest source not found: $source" >&2
+    rm -f "$dest"
+    return 1
+  fi
+
+  # Validate it looks like a manifest
+  local project
+  project=$(yq -r '.project // ""' "$dest")
+  if [[ -z "$project" || "$project" == "null" ]]; then
+    echo "Error: fetched file is not a valid manifest (no 'project' field)" >&2
+    rm -f "$dest"
+    return 1
+  fi
+
+  echo "$dest"
+}
+
+# Check if the current repo is the master manifest repo.
+# Compares git remote origin against the master URL.
+is_master_repo() {
+  local master_url="$1"
+  local remote_url
+  remote_url=$(git remote get-url origin 2>/dev/null || echo "")
+  [[ -z "$remote_url" ]] && return 1
+
+  # Extract org/repo from both URLs and compare
+  # Handles github.com, raw.githubusercontent.com, and SSH URLs
+  local master_repo remote_repo
+  master_repo=$(echo "$master_url" | grep -oP '(?:github\.com|githubusercontent\.com)[/:]?\K[^/]+/[^/]+' | sed 's/\.git$//' || echo "")
+  remote_repo=$(echo "$remote_url" | grep -oP '(?:github\.com|githubusercontent\.com)[/:]?\K[^/]+/[^/]+' | sed 's/\.git$//' || echo "")
+
+  [[ -n "$master_repo" && "$master_repo" == "$remote_repo" ]]
+}
+
+# --- init command ---
+
+cmd_init() {
+  local select_all=false
+  local master_source=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all)  select_all=true; shift ;;
+      --help|-h) echo "Usage: bao-env init [--all] [URL|PATH]"; exit 0 ;;
+      -*)     echo "Unknown option: $1" >&2; exit 1 ;;
+      *)      master_source="$1"; shift ;;
+    esac
+  done
+
+  # Determine master source
+  if [[ -z "$master_source" ]]; then
+    if [[ -f "$MANIFEST" ]]; then
+      master_source=$(yq -r '.master // ""' "$MANIFEST")
+    fi
+    if [[ -z "$master_source" ]]; then
+      echo "Error: no master URL provided and no 'master' field in local manifest." >&2
+      echo "Usage: bao-env init [--all] <URL|PATH>" >&2
+      exit 1
+    fi
+  fi
+
+  # Fetch master
+  echo "Fetching master manifest..."
+  local master_file
+  master_file=$(fetch_master_manifest "$master_source") || exit 1
+  trap "rm -f '$master_file'" EXIT
+
+  # Parse master
+  local -a master_config=() master_secret=()
+  while IFS= read -r var; do
+    [[ -z "$var" || "$var" == "null" ]] && continue
+    master_config+=("$var")
+  done < <(yq -r '.config[]' "$master_file" 2>/dev/null)
+  while IFS= read -r var; do
+    [[ -z "$var" || "$var" == "null" ]] && continue
+    master_secret+=("$var")
+  done < <(yq -r '.secret[]' "$master_file" 2>/dev/null)
+
+  local master_project master_environments master_sparse
+  master_project=$(yq -r '.project' "$master_file")
+  master_environments=$(yq -r '.environments | @json' "$master_file")
+  master_sparse=$(yq -r '.sparse // [] | @json' "$master_file")
+
+  # Parse local manifest if it exists
+  local -a local_config=() local_secret=()
+  local -A local_vars=()
+  local has_local=false
+
+  if [[ -f "$MANIFEST" ]]; then
+    has_local=true
+    while IFS= read -r var; do
+      [[ -z "$var" || "$var" == "null" ]] && continue
+      local_config+=("$var")
+      local_vars["$var"]=1
+    done < <(yq -r '.config[]' "$MANIFEST" 2>/dev/null)
+    while IFS= read -r var; do
+      [[ -z "$var" || "$var" == "null" ]] && continue
+      local_secret+=("$var")
+      local_vars["$var"]=1
+    done < <(yq -r '.secret[]' "$MANIFEST" 2>/dev/null)
+  fi
+
+  # Compute available vars (in master but not in local)
+  local -a avail_config=() avail_secret=()
+  for var in "${master_config[@]}"; do
+    [[ -z "${local_vars[$var]+x}" ]] && avail_config+=("$var")
+  done
+  for var in "${master_secret[@]}"; do
+    [[ -z "${local_vars[$var]+x}" ]] && avail_secret+=("$var")
+  done
+
+  local avail_total=$(( ${#avail_config[@]} + ${#avail_secret[@]} ))
+
+  if [[ "$has_local" == true && $avail_total -eq 0 ]]; then
+    echo "All master variables are already in your local manifest."
+    exit 0
+  fi
+
+  # Select vars
+  local -a selected_config=() selected_secret=()
+
+  if $select_all; then
+    selected_config=("${avail_config[@]}")
+    selected_secret=("${avail_secret[@]}")
+  else
+    # Build numbered list for interactive selection
+    local -a items=() item_types=() item_names=()
+    local i=1
+
+    if [[ ${#avail_config[@]} -gt 0 ]]; then
+      echo ""
+      echo "Available config variables:"
+      for var in "${avail_config[@]}"; do
+        printf "  %3d) %s\n" "$i" "$var"
+        items+=("$i")
+        item_types+=("config")
+        item_names+=("$var")
+        i=$((i + 1))
+      done
+    fi
+
+    if [[ ${#avail_secret[@]} -gt 0 ]]; then
+      echo ""
+      echo "Available secret variables:"
+      for var in "${avail_secret[@]}"; do
+        printf "  %3d) %s\n" "$i" "$var"
+        items+=("$i")
+        item_types+=("secret")
+        item_names+=("$var")
+        i=$((i + 1))
+      done
+    fi
+
+    echo ""
+    read -rp "Enter numbers to add (comma-separated), 'all', or 'none': " selection
+
+    if [[ "$selection" == "none" || -z "$selection" ]]; then
+      echo "No changes made."
+      exit 0
+    fi
+
+    if [[ "$selection" == "all" ]]; then
+      selected_config=("${avail_config[@]}")
+      selected_secret=("${avail_secret[@]}")
+    else
+      IFS=',' read -ra nums <<< "$selection"
+      for num in "${nums[@]}"; do
+        num=$(echo "$num" | tr -d ' ')
+        local idx=$((num - 1))
+        if [[ $idx -lt 0 || $idx -ge ${#item_names[@]} ]]; then
+          echo "Warning: skipping invalid number: $num" >&2
+          continue
+        fi
+        if [[ "${item_types[$idx]}" == "config" ]]; then
+          selected_config+=("${item_names[$idx]}")
+        else
+          selected_secret+=("${item_names[$idx]}")
+        fi
+      done
+    fi
+  fi
+
+  local selected_total=$(( ${#selected_config[@]} + ${#selected_secret[@]} ))
+  if [[ $selected_total -eq 0 ]]; then
+    echo "No variables selected."
+    exit 0
+  fi
+
+  # Merge with existing
+  local -a final_config=("${local_config[@]}" "${selected_config[@]}")
+  local -a final_secret=("${local_secret[@]}" "${selected_secret[@]}")
+
+  # Sort for consistent output
+  IFS=$'\n' final_config=($(sort <<<"${final_config[*]}")); unset IFS
+  IFS=$'\n' final_secret=($(sort <<<"${final_secret[*]}")); unset IFS
+
+  # Build YAML via jq + yq
+  local json
+  json=$(jq -n \
+    --arg master "$master_source" \
+    --arg project "$master_project" \
+    --argjson environments "$master_environments" \
+    --argjson sparse "$master_sparse" \
+    --argjson config "$(printf '%s\n' "${final_config[@]}" | jq -R . | jq -s .)" \
+    --argjson secret "$(printf '%s\n' "${final_secret[@]}" | jq -R . | jq -s .)" \
+    '{master: $master, project: $project, environments: $environments, sparse: $sparse, config: $config, secret: $secret}')
+
+  echo "$json" | yq -P '.' > "$MANIFEST"
+
+  echo ""
+  echo "Wrote $MANIFEST"
+  echo "  Config: ${#final_config[@]} vars (${#selected_config[@]} added)"
+  echo "  Secret: ${#final_secret[@]} vars (${#selected_secret[@]} added)"
+}
+
+# --- audit command ---
+
+cmd_audit() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h) echo "Usage: bao-env audit"; exit 0 ;;
+      -*)     echo "Unknown option: $1" >&2; exit 1 ;;
+      *)      echo "Unknown argument: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  # Require local manifest
+  if [[ ! -f "$MANIFEST" ]]; then
+    echo "Error: no local manifest found at $MANIFEST" >&2
+    exit 1
+  fi
+
+  # Read master URL from manifest
+  local master_url
+  master_url=$(yq -r '.master // ""' "$MANIFEST")
+
+  if [[ -z "$master_url" ]]; then
+    echo "Error: no 'master' field in $MANIFEST" >&2
+    echo "Add a 'master:' field pointing to the master manifest URL." >&2
+    exit 1
+  fi
+
+  # Check if we ARE the master
+  if is_master_repo "$master_url"; then
+    echo "This is the master manifest. Nothing to audit against."
+    exit 0
+  fi
+
+  # Load local manifest into globals
+  load_manifest
+
+  # Fetch master
+  echo "Fetching master manifest..."
+  local master_file
+  master_file=$(fetch_master_manifest "$master_url") || exit 1
+  trap "rm -f '$master_file'" EXIT
+
+  # Parse master into associative array
+  local -A master_type=()
+  local -a master_all=()
+  while IFS= read -r var; do
+    [[ -z "$var" || "$var" == "null" ]] && continue
+    master_type["$var"]="config"
+    master_all+=("$var")
+  done < <(yq -r '.config[]' "$master_file" 2>/dev/null)
+  while IFS= read -r var; do
+    [[ -z "$var" || "$var" == "null" ]] && continue
+    master_type["$var"]="secret"
+    master_all+=("$var")
+  done < <(yq -r '.secret[]' "$master_file" 2>/dev/null)
+
+  # Compare
+  local -a errors=()
+  local -a available=()
+  local has_errors=false
+
+  # Check local vars against master
+  for var in "${ALL_VARS[@]}"; do
+    if [[ -z "${master_type[$var]+x}" ]]; then
+      errors+=("  $var  — not in master manifest")
+      has_errors=true
+    elif [[ "${VAR_TYPE[$var]}" != "${master_type[$var]}" ]]; then
+      errors+=("  $var  — type mismatch (local: ${VAR_TYPE[$var]}, master: ${master_type[$var]})")
+      has_errors=true
+    fi
+  done
+
+  # Check master vars not in local
+  for var in "${master_all[@]}"; do
+    if [[ -z "${VAR_TYPE[$var]+x}" ]]; then
+      available+=("  $var  (${master_type[$var]})")
+    fi
+  done
+
+  # Report
+  echo ""
+  if [[ ${#errors[@]} -gt 0 ]]; then
+    echo "Errors:"
+    for line in "${errors[@]}"; do
+      echo "$line"
+    done
+    echo ""
+  fi
+
+  if [[ ${#available[@]} -gt 0 ]]; then
+    echo "Available (not claimed by this project):"
+    for line in "${available[@]}"; do
+      echo "$line"
+    done
+    echo ""
+  fi
+
+  local error_count=${#errors[@]}
+  local avail_count=${#available[@]}
+  echo "Summary: ${error_count} error(s), ${avail_count} available"
+
+  if $has_errors; then
+    exit 1
+  fi
+}
+
 # --- Argument parsing ---
 
 while [[ $# -gt 0 ]]; do
@@ -1547,19 +1900,26 @@ fi
 
 SUBCOMMAND="$1"; shift
 
-load_manifest
-
 case "$SUBCOMMAND" in
-  show)    cmd_show "$@" ;;
-  check)   cmd_check "$@" ;;
-  compare) cmd_compare "$@" ;;
-  sync)    cmd_sync "$@" ;;
-  set)     cmd_set "$@" ;;
-  copy)    cmd_copy "$@" ;;
-  delete)  cmd_delete "$@" ;;
-  clear)   cmd_clear "$@" ;;
+  # These commands manage their own manifest loading
+  init)    cmd_init "$@" ;;
+  audit)   cmd_audit "$@" ;;
+  # All other commands require a loaded manifest
   *)
-    echo "Unknown subcommand: $SUBCOMMAND" >&2
-    usage
+    load_manifest
+    case "$SUBCOMMAND" in
+      show)    cmd_show "$@" ;;
+      check)   cmd_check "$@" ;;
+      compare) cmd_compare "$@" ;;
+      sync)    cmd_sync "$@" ;;
+      set)     cmd_set "$@" ;;
+      copy)    cmd_copy "$@" ;;
+      delete)  cmd_delete "$@" ;;
+      clear)   cmd_clear "$@" ;;
+      *)
+        echo "Unknown subcommand: $SUBCOMMAND" >&2
+        usage
+        ;;
+    esac
     ;;
 esac
