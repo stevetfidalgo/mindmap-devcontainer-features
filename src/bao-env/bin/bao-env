@@ -1547,7 +1547,11 @@ fetch_master_manifest() {
   dest="$(mktemp)"
 
   if [[ "$source" =~ ^https?:// ]]; then
-    if ! curl -fsSL "$source" -o "$dest" 2>/dev/null; then
+    local -a curl_opts=(-fsSL)
+    if [[ -n "${GITHUB_TOKEN:-}" && "$source" == *github* ]]; then
+      curl_opts+=(-H "Authorization: token $GITHUB_TOKEN")
+    fi
+    if ! curl "${curl_opts[@]}" "$source" -o "$dest" 2>/dev/null; then
       echo "Error: failed to fetch master manifest from $source" >&2
       rm -f "$dest"
       return 1
@@ -1826,10 +1830,34 @@ cmd_audit() {
     master_all+=("$var")
   done < <(yq -r '.secret[]' "$master_file" 2>/dev/null)
 
+  # Parse master metadata
+  local master_project master_environments master_sparse
+  master_project=$(yq -r '.project' "$master_file")
+  master_environments=$(yq -r '.environments | sort | join(",")' "$master_file")
+  master_sparse=$(yq -r '.sparse // [] | sort | join(",")' "$master_file")
+
+  local local_environments local_sparse
+  local_environments=$(printf '%s\n' "${ENVIRONMENTS[@]}" | sort | paste -sd,)
+  local_sparse=$(printf '%s\n' "${SPARSE_ENVS[@]}" | sort | paste -sd,)
+
   # Compare
   local -a errors=()
+  local -a warnings=()
   local -a available=()
   local has_errors=false
+
+  # Check metadata consistency with master
+  if [[ "$PROJECT" != "$master_project" ]]; then
+    warnings+=("  project: local='$PROJECT' master='$master_project'")
+  fi
+  if [[ "$local_environments" != "$master_environments" ]]; then
+    errors+=("  environments: local=[$local_environments] master=[$master_environments]")
+    has_errors=true
+  fi
+  if [[ "$local_sparse" != "$master_sparse" ]]; then
+    errors+=("  sparse: local=[$local_sparse] master=[$master_sparse]")
+    has_errors=true
+  fi
 
   # Check local vars against master
   for var in "${ALL_VARS[@]}"; do
@@ -1859,6 +1887,14 @@ cmd_audit() {
     echo ""
   fi
 
+  if [[ ${#warnings[@]} -gt 0 ]]; then
+    echo "Warnings:"
+    for line in "${warnings[@]}"; do
+      echo "$line"
+    done
+    echo ""
+  fi
+
   if [[ ${#available[@]} -gt 0 ]]; then
     echo "Available (not claimed by this project):"
     for line in "${available[@]}"; do
@@ -1868,8 +1904,9 @@ cmd_audit() {
   fi
 
   local error_count=${#errors[@]}
+  local warn_count=${#warnings[@]}
   local avail_count=${#available[@]}
-  echo "Summary: ${error_count} error(s), ${avail_count} available"
+  echo "Summary: ${error_count} error(s), ${warn_count} warning(s), ${avail_count} available"
 
   if $has_errors; then
     exit 1
