@@ -1550,15 +1550,20 @@ fetch_master_manifest() {
     # GitHub raw URL — use gh api to avoid token scope issues
     local gh_owner="${BASH_REMATCH[1]}" gh_repo="${BASH_REMATCH[2]}"
     local gh_ref="${BASH_REMATCH[3]}" gh_path="${BASH_REMATCH[4]}"
-    if command -v gh &>/dev/null && gh auth status &>/dev/null; then
-      if ! gh api "repos/${gh_owner}/${gh_repo}/contents/${gh_path}?ref=${gh_ref}" \
-           -H "Accept: application/vnd.github.raw+json" > "$dest" 2>/dev/null; then
-        echo "Error: failed to fetch master manifest from $source" >&2
-        rm -f "$dest"
-        return 1
-      fi
-    else
-      echo "Error: 'gh' CLI not found or not authenticated. Run 'gh auth login'." >&2
+    if ! command -v gh &>/dev/null; then
+      echo "Error: 'gh' CLI not found. Install it to fetch from private GitHub repos." >&2
+      rm -f "$dest"
+      return 1
+    fi
+    local -x GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+    if [[ -z "$GH_TOKEN" ]]; then
+      echo "Error: no GitHub token found. Set GITHUB_TOKEN or GH_TOKEN, or run 'gh auth login'." >&2
+      rm -f "$dest"
+      return 1
+    fi
+    if ! gh api "repos/${gh_owner}/${gh_repo}/contents/${gh_path}?ref=${gh_ref}" \
+         -H "Accept: application/vnd.github.raw+json" > "$dest" 2>/dev/null; then
+      echo "Error: failed to fetch master manifest from $source" >&2
       rm -f "$dest"
       return 1
     fi
