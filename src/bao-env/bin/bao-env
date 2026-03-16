@@ -1546,12 +1546,25 @@ fetch_master_manifest() {
   local dest
   dest="$(mktemp)"
 
-  if [[ "$source" =~ ^https?:// ]]; then
-    local -a curl_opts=(-fsSL)
-    if [[ -n "${GITHUB_TOKEN:-}" && "$source" == *github* ]]; then
-      curl_opts+=(-H "Authorization: token $GITHUB_TOKEN")
+  if [[ "$source" =~ ^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$ ]]; then
+    # GitHub raw URL — use gh api to avoid token scope issues
+    local gh_owner="${BASH_REMATCH[1]}" gh_repo="${BASH_REMATCH[2]}"
+    local gh_ref="${BASH_REMATCH[3]}" gh_path="${BASH_REMATCH[4]}"
+    if command -v gh &>/dev/null && gh auth status &>/dev/null; then
+      if ! gh api "repos/${gh_owner}/${gh_repo}/contents/${gh_path}?ref=${gh_ref}" \
+           -H "Accept: application/vnd.github.raw+json" > "$dest" 2>/dev/null; then
+        echo "Error: failed to fetch master manifest from $source" >&2
+        rm -f "$dest"
+        return 1
+      fi
+    else
+      echo "Error: 'gh' CLI not found or not authenticated. Run 'gh auth login'." >&2
+      rm -f "$dest"
+      return 1
     fi
-    if ! curl "${curl_opts[@]}" "$source" -o "$dest" 2>/dev/null; then
+  elif [[ "$source" =~ ^https?:// ]]; then
+    # Non-GitHub URL — use curl directly
+    if ! curl -fsSL "$source" -o "$dest" 2>/dev/null; then
       echo "Error: failed to fetch master manifest from $source" >&2
       rm -f "$dest"
       return 1
