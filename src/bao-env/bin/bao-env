@@ -1555,11 +1555,9 @@ fetch_master_manifest() {
       rm -f "$dest"
       return 1
     fi
-    local -x GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-    if [[ -z "$GH_TOKEN" ]]; then
-      echo "Error: no GitHub token found. Set GITHUB_TOKEN or GH_TOKEN, or run 'gh auth login'." >&2
-      rm -f "$dest"
-      return 1
+    # Pass GITHUB_TOKEN as GH_TOKEN if gh isn't otherwise authenticated
+    if [[ -n "${GITHUB_TOKEN:-}" && -z "${GH_TOKEN:-}" ]]; then
+      local -x GH_TOKEN="$GITHUB_TOKEN"
     fi
     if ! gh api "repos/${gh_owner}/${gh_repo}/contents/${gh_path}?ref=${gh_ref}" \
          -H "Accept: application/vnd.github.raw+json" > "$dest" 2>/dev/null; then
