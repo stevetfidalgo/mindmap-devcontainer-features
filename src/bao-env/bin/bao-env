@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 #
+BAO_ENV_VERSION="1.2.0"
+#
 # Manage OpenBao environment variables from a YAML manifest.
 #
 # Unified CLI for viewing, checking, comparing, syncing, setting,
@@ -1940,6 +1942,8 @@ while [[ $# -gt 0 ]]; do
       MANIFEST="$2"; shift 2 ;;
     --help|-h)
       usage 0 ;;
+    --version|-V)
+      echo "bao-env $BAO_ENV_VERSION"; exit 0 ;;
     -*)
       echo "Unknown option: $1" >&2; usage ;;
     *)
